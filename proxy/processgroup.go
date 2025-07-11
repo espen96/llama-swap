@@ -22,6 +22,9 @@ type ProcessGroup struct {
 	// map of current processes
 	processes       map[string]*Process
 	lastUsedProcess string
+
+	backendType string
+	baseURL     string
 }
 
 func NewProcessGroup(id string, config Config, proxyLogger *LogMonitor, upstreamLogger *LogMonitor) *ProcessGroup {
@@ -36,6 +39,8 @@ func NewProcessGroup(id string, config Config, proxyLogger *LogMonitor, upstream
 		swap:           groupConfig.Swap,
 		exclusive:      groupConfig.Exclusive,
 		persistent:     groupConfig.Persistent,
+		backendType:    groupConfig.BackendType, // ADD THIS LINE
+		baseURL:        groupConfig.BaseURL,     // ADD THIS LINE
 		proxyLogger:    proxyLogger,
 		upstreamLogger: upstreamLogger,
 		processes:      make(map[string]*Process),
