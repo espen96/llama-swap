@@ -118,16 +118,22 @@ type GroupConfig struct {
 	Exclusive  bool     `yaml:"exclusive"`
 	Persistent bool     `yaml:"persistent"`
 	Members    []string `yaml:"members"`
+
+	// ADD THESE TWO LINES:
+	BackendType string `yaml:"backend_type"`
+	BaseURL     string `yaml:"base_url"`
 }
 
 // set default values for GroupConfig
 func (c *GroupConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	type rawGroupConfig GroupConfig
 	defaults := rawGroupConfig{
-		Swap:       true,
-		Exclusive:  true,
-		Persistent: false,
-		Members:    []string{},
+		Swap:        true,
+		Exclusive:   true,
+		Persistent:  false,
+		Members:     []string{},
+		BackendType: "custom",
+		BaseURL:     "",
 	}
 
 	if err := unmarshal(&defaults); err != nil {

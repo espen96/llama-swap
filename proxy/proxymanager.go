@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -154,6 +155,13 @@ func (pm *ProxyManager) setupGinEngine() {
 	})
 
 	mm := MetricsMiddleware(pm)
+	// Ollama API passthrough routes
+	pm.ginEngine.POST("/api/chat", pm.proxyOllamaPassthrough)
+	pm.ginEngine.POST("/api/generate", pm.proxyOllamaPassthrough)
+	pm.ginEngine.POST("/api/embed", pm.proxyOllamaPassthrough)
+	pm.ginEngine.GET("/api/tags", pm.proxyOllamaPassthrough)
+	pm.ginEngine.GET("/api/ps", pm.proxyOllamaPassthrough)
+	pm.ginEngine.POST("/api/show", pm.proxyOllamaPassthrough)
 
 	// Set up routes using the Gin engine
 	pm.ginEngine.POST("/v1/chat/completions", mm, pm.proxyOAIHandler)
@@ -296,7 +304,14 @@ func (pm *ProxyManager) swapProcessGroup(requestedModel string) (*ProcessGroup, 
 		pm.proxyLogger.Debugf("Exclusive mode for group %s, stopping other process groups", processGroup.id)
 		for groupId, otherGroup := range pm.processGroups {
 			if groupId != processGroup.id && !otherGroup.persistent {
-				otherGroup.StopProcesses(StopWaitForInflightRequest)
+				// Check if this is an Ollama group
+				if otherGroup.backendType == "ollama" {
+					pm.proxyLogger.Debugf("Unloading Ollama group: %s", groupId)
+					go pm.sendOllamaUnloadAll(otherGroup)
+				} else {
+					// Regular process group - stop processes
+					otherGroup.StopProcesses(StopWaitForInflightRequest)
+				}
 			}
 		}
 	}
@@ -579,5 +594,235 @@ func (pm *ProxyManager) findGroupByModelName(modelName string) *ProcessGroup {
 			return group
 		}
 	}
+	return nil
+}
+
+func (pm *ProxyManager) proxyOllamaPassthrough(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "could not read request body")
+		return
+	}
+
+	// Extract model name for management (if present)
+	var requestedModel string
+	if len(bodyBytes) > 0 {
+		requestedModel = gjson.GetBytes(bodyBytes, "model").String()
+	}
+
+	// Find Ollama process group
+	ollamaGroup := pm.findOllamaGroup()
+	if ollamaGroup == nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "no Ollama backend configured")
+		return
+	}
+
+	// If we have a model, do the management logic
+	if requestedModel != "" {
+		// Try to map the model name through existing config
+		realModelName, found := pm.config.RealModelName(requestedModel)
+		if found {
+			// Use the real model name
+			bodyBytes, err = sjson.SetBytes(bodyBytes, "model", realModelName)
+			if err != nil {
+				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name: %s", err.Error()))
+				return
+			}
+			requestedModel = realModelName
+		}
+
+		// Send unload signal to other process groups
+		pm.signalUnloadOtherGroups(ollamaGroup, requestedModel)
+	}
+
+	// Rebuild request body
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	c.Request.Header.Del("transfer-encoding")
+	c.Request.Header.Set("content-length", strconv.Itoa(len(bodyBytes)))
+	c.Request.ContentLength = int64(len(bodyBytes))
+
+	// Direct HTTP call to Ollama (bypass ProcessGroup.ProxyRequest)
+	if err := pm.proxyDirectToOllama(ollamaGroup, c.Writer, c.Request); err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying to Ollama: %s", err.Error()))
+		pm.proxyLogger.Errorf("Error Proxying Ollama Request for model %s: %v", requestedModel, err)
+		return
+	}
+}
+
+func (pm *ProxyManager) findOllamaGroup() *ProcessGroup {
+	// Look for a group configured as Ollama backend
+	for _, group := range pm.processGroups {
+		if group.backendType == "ollama" {
+			return group
+		}
+	}
+	return nil
+}
+
+func (pm *ProxyManager) signalUnloadOtherGroups(activeGroup *ProcessGroup, newModel string) {
+	// Only unload if the new group is exclusive
+	if !activeGroup.exclusive {
+		return
+	}
+
+	pm.proxyLogger.Debugf("Unloading other groups before loading Ollama model: %s", newModel)
+
+	for groupId, otherGroup := range pm.processGroups {
+		if groupId != activeGroup.id && !otherGroup.persistent {
+			// For non-Ollama groups: stop processes
+			if otherGroup.backendType != "ollama" {
+				pm.proxyLogger.Debugf("Stopping non-Ollama group: %s", groupId)
+				otherGroup.StopProcesses(StopWaitForInflightRequest)
+			} else {
+				// For other Ollama groups: send unload signal
+				pm.proxyLogger.Debugf("Unloading other Ollama group: %s", groupId)
+				go pm.sendOllamaUnloadAll(otherGroup)
+			}
+		}
+	}
+}
+func (pm *ProxyManager) sendOllamaUnloadAll(ollamaGroup *ProcessGroup) {
+	// Get running models from Ollama
+	runningModels, err := pm.getOllamaRunningModels(ollamaGroup)
+	if err != nil {
+		pm.proxyLogger.Errorf("Failed to get running Ollama models: %v", err)
+		return
+	}
+
+	// Send unload signal to each model
+	for _, modelName := range runningModels {
+		pm.proxyLogger.Debugf("Unloading Ollama model: %s", modelName)
+
+		unloadRequest := map[string]interface{}{
+			"model":      modelName,
+			"messages":   []interface{}{},
+			"keep_alive": 0,
+		}
+
+		// Make async call to unload
+		go pm.callOllamaUnload(ollamaGroup, unloadRequest)
+	}
+}
+
+func (pm *ProxyManager) getOllamaRunningModels(group *ProcessGroup) ([]string, error) {
+	if group.baseURL == "" {
+		return nil, fmt.Errorf("no base URL configured for group %s", group.id)
+	}
+
+	// Create HTTP client
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	// Call /api/ps endpoint
+	resp, err := client.Get(group.baseURL + "/api/ps")
+	if err != nil {
+		return nil, fmt.Errorf("failed to call /api/ps: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code from /api/ps: %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read /api/ps response: %v", err)
+	}
+
+	// Parse response to extract model names
+	var models []string
+	modelsArray := gjson.GetBytes(bodyBytes, "models")
+	if modelsArray.Exists() {
+		modelsArray.ForEach(func(_, value gjson.Result) bool {
+			if modelName := value.Get("name").String(); modelName != "" {
+				models = append(models, modelName)
+			}
+			return true
+		})
+	}
+
+	return models, nil
+}
+
+func (pm *ProxyManager) callOllamaUnload(group *ProcessGroup, request map[string]interface{}) {
+	if group.baseURL == "" {
+		pm.proxyLogger.Errorf("No base URL configured for group %s", group.id)
+		return
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// Convert request to JSON
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		pm.proxyLogger.Errorf("Failed to marshal unload request: %v", err)
+		return
+	}
+
+	// Make the unload request
+	resp, err := client.Post(
+		group.baseURL+"/api/chat",
+		"application/json",
+		bytes.NewBuffer(requestBytes),
+	)
+	if err != nil {
+		pm.proxyLogger.Errorf("Failed to send unload request: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		pm.proxyLogger.Errorf("Unload request failed with status: %d", resp.StatusCode)
+		return
+	}
+
+	// Log success
+	modelName := request["model"].(string)
+	pm.proxyLogger.Debugf("Successfully sent unload signal for model: %s", modelName)
+}
+func (pm *ProxyManager) proxyDirectToOllama(group *ProcessGroup, writer http.ResponseWriter, request *http.Request) error {
+	if group.baseURL == "" {
+		return fmt.Errorf("no base URL configured for Ollama group %s", group.id)
+	}
+
+	// Create the target URL
+	targetURL := group.baseURL + request.URL.Path
+
+	// Create new request to Ollama
+	proxyReq, err := http.NewRequest(request.Method, targetURL, request.Body)
+	if err != nil {
+		return fmt.Errorf("failed to create proxy request: %v", err)
+	}
+
+	// Copy headers
+	for name, values := range request.Header {
+		for _, value := range values {
+			proxyReq.Header.Add(name, value)
+		}
+	}
+
+	// Make the request to Ollama
+	client := &http.Client{Timeout: 300 * time.Second} // 5 minute timeout for long generations
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		return fmt.Errorf("failed to proxy to Ollama: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Copy response headers
+	for name, values := range resp.Header {
+		for _, value := range values {
+			writer.Header().Add(name, value)
+		}
+	}
+
+	// Set status code
+	writer.WriteHeader(resp.StatusCode)
+
+	// Copy response body
+	_, err = io.Copy(writer, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to copy response body: %v", err)
+	}
+
 	return nil
 }
