@@ -29,6 +29,8 @@ type ProxyManager struct {
 	config    Config
 	ginEngine *gin.Engine
 
+	ollamaTranslator *OllamaToOAITranslator
+
 	// logging
 	proxyLogger    *LogMonitor
 	upstreamLogger *LogMonitor
@@ -88,6 +90,8 @@ func New(config Config) *ProxyManager {
 		shutdownCtx:    shutdownCtx,
 		shutdownCancel: shutdownCancel,
 	}
+
+	pm.ollamaTranslator = &OllamaToOAITranslator{pm: pm}
 
 	// create the process groups
 	for groupID := range config.Groups {
@@ -159,9 +163,9 @@ func (pm *ProxyManager) setupGinEngine() {
 	pm.ginEngine.POST("/api/chat", pm.proxyOllamaPassthrough)
 	pm.ginEngine.POST("/api/generate", pm.proxyOllamaPassthrough)
 	pm.ginEngine.POST("/api/embed", pm.proxyOllamaPassthrough)
-	pm.ginEngine.GET("/api/tags", pm.proxyOllamaPassthrough)
-	pm.ginEngine.GET("/api/ps", pm.proxyOllamaPassthrough)
-	pm.ginEngine.POST("/api/show", pm.proxyOllamaPassthrough)
+	pm.ginEngine.GET("/api/tags", pm.handleOllamaTagsRequest)
+	pm.ginEngine.GET("/api/ps", pm.handleOllamaPsRequest)
+	pm.ginEngine.POST("/api/show", pm.handleOllamaShowRequest)
 
 	// Set up routes using the Gin engine
 	pm.ginEngine.POST("/v1/chat/completions", mm, pm.proxyOAIHandler)
@@ -598,18 +602,420 @@ func (pm *ProxyManager) findGroupByModelName(modelName string) *ProcessGroup {
 }
 
 func (pm *ProxyManager) proxyOllamaPassthrough(c *gin.Context) {
+	// Handle special endpoints that don't need model routing
+	switch c.Request.URL.Path {
+	case "/api/tags":
+		pm.handleOllamaTagsRequest(c)
+		return
+	case "/api/ps":
+		pm.handleOllamaPsRequest(c)
+		return
+	case "/api/show":
+		pm.handleOllamaShowRequest(c)
+		return
+	}
+
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		pm.sendErrorResponse(c, http.StatusBadRequest, "could not read request body")
 		return
 	}
 
-	// Extract model name for management (if present)
+	// Extract model name for routing
 	var requestedModel string
 	if len(bodyBytes) > 0 {
 		requestedModel = gjson.GetBytes(bodyBytes, "model").String()
 	}
 
+	if requestedModel == "" {
+		// No model specified - might be a list operation, pass through to Ollama
+		pm.handleOllamaPassthroughRequest(c, bodyBytes, "")
+		return
+	}
+
+	// Map the model name if needed
+	realModelName, found := pm.config.RealModelName(requestedModel)
+	if found {
+		requestedModel = realModelName
+	}
+
+	// Check if this is an OAI model that needs translation
+	if pm.ollamaTranslator.isOAIModel(requestedModel) {
+		pm.handleOllamaToOAITranslation(c, bodyBytes, requestedModel)
+		return
+	}
+
+	// It's a native Ollama model, use existing passthrough logic
+	pm.handleOllamaPassthroughRequest(c, bodyBytes, requestedModel)
+}
+
+func (pm *ProxyManager) findOllamaGroup() *ProcessGroup {
+	// Look for a group configured as Ollama backend
+	for _, group := range pm.processGroups {
+		if group.backendType == "ollama" {
+			return group
+		}
+	}
+	return nil
+}
+
+// New method to handle translation from Ollama to OAI
+
+// Modified handler for /api/tags to include all models
+func (pm *ProxyManager) handleOllamaTagsRequest(c *gin.Context) {
+	models := []map[string]interface{}{}
+	ollamaModelNames := make(map[string]bool) // Track Ollama model names to avoid duplicates
+
+	// First, get native Ollama models if available
+	ollamaGroup := pm.findOllamaGroup()
+	if ollamaGroup != nil && ollamaGroup.baseURL != "" {
+		// Fetch from real Ollama
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(ollamaGroup.baseURL + "/api/tags")
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				if ollamaModels := gjson.GetBytes(bodyBytes, "models"); ollamaModels.Exists() {
+					ollamaModels.ForEach(func(_, value gjson.Result) bool {
+						modelName := value.Get("name").String()
+						ollamaModelNames[modelName] = true // Track this name
+
+						model := map[string]interface{}{
+							"name":        modelName,
+							"model":       value.Get("model").String(),
+							"modified_at": value.Get("modified_at").String(),
+							"size":        value.Get("size").Int(),
+							"digest":      value.Get("digest").String(),
+							"details":     value.Get("details").Value(),
+						}
+						models = append(models, model)
+						return true
+					})
+				}
+			}
+		}
+	}
+
+	// Add OAI models
+	for modelID, modelConfig := range pm.config.Models {
+		if modelConfig.Unlisted {
+			continue
+		}
+
+		// Check if this is an OAI model (not in an Ollama group)
+		group := pm.findGroupByModelName(modelID)
+		if group != nil && group.backendType != "ollama" {
+			// Skip if this name already exists as an Ollama model
+			if ollamaModelNames[modelID] {
+				continue
+			}
+
+			// Format as Ollama model entry - matching exact structure
+			model := map[string]interface{}{
+				"name":        modelID,
+				"model":       modelID, // Add this field
+				"modified_at": time.Now().Format(time.RFC3339),
+				"size":        0,                   // Unknown for OAI models
+				"digest":      "openai:" + modelID, // Fake digest to indicate it's an OAI model
+				"details": map[string]interface{}{
+					"parent_model":       "",
+					"format":             "openai",
+					"family":             "openai",
+					"families":           []string{"openai"}, // Array format
+					"parameter_size":     "unknown",
+					"quantization_level": "none",
+				},
+			}
+
+			// Add aliases as separate entries
+			for _, alias := range modelConfig.Aliases {
+				// Skip if alias conflicts with Ollama model name
+				if ollamaModelNames[alias] {
+					continue
+				}
+
+				aliasModel := map[string]interface{}{
+					"name":        alias,
+					"model":       alias, // Add this field
+					"modified_at": time.Now().Format(time.RFC3339),
+					"size":        0,
+					"digest":      "openai:" + modelID, // Points to real model
+					"details": map[string]interface{}{
+						"parent_model":       "",
+						"format":             "openai",
+						"family":             "openai",
+						"families":           []string{"openai"}, // Array format
+						"parameter_size":     "unknown",
+						"quantization_level": "none",
+					},
+				}
+				models = append(models, aliasModel)
+			}
+
+			models = append(models, model)
+		}
+	}
+
+	// Return combined list
+	c.JSON(http.StatusOK, gin.H{
+		"models": models,
+	})
+}
+
+// Modified handler for /api/ps to show running models from all sources
+func (pm *ProxyManager) handleOllamaPsRequest(c *gin.Context) {
+	runningModels := []map[string]interface{}{}
+
+	// Get Ollama running models if available
+	ollamaGroup := pm.findOllamaGroup()
+	if ollamaGroup != nil && ollamaGroup.baseURL != "" {
+		client := &http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get(ollamaGroup.baseURL + "/api/ps")
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				if models := gjson.GetBytes(bodyBytes, "models"); models.Exists() {
+					models.ForEach(func(_, value gjson.Result) bool {
+						model := map[string]interface{}{
+							"name":       value.Get("name").String(),
+							"model":      value.Get("model").String(),
+							"size":       value.Get("size").Int(),
+							"digest":     value.Get("digest").String(),
+							"expires_at": value.Get("expires_at").String(),
+							"size_vram":  value.Get("size_vram").Int(),
+						}
+						runningModels = append(runningModels, model)
+						return true
+					})
+				}
+			}
+		}
+	}
+
+	// Add running OAI models
+	for _, processGroup := range pm.processGroups {
+		if processGroup.backendType != "ollama" {
+			for modelID, process := range processGroup.processes {
+				if process.CurrentState() == StateReady {
+					model := map[string]interface{}{
+						"name":       modelID,
+						"model":      modelID,
+						"size":       0, // Unknown for OAI
+						"digest":     "openai:" + modelID,
+						"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339), // Fake expiry
+						"size_vram":  0,                                              // Unknown
+					}
+					runningModels = append(runningModels, model)
+				}
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"models": runningModels,
+	})
+}
+
+// Modified handler for /api/show to handle OAI models
+func (pm *ProxyManager) handleOllamaShowRequest(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "could not read request body")
+		return
+	}
+
+	requestedModel := gjson.GetBytes(bodyBytes, "name").String()
+	if requestedModel == "" {
+		requestedModel = gjson.GetBytes(bodyBytes, "model").String()
+	}
+
+	if requestedModel == "" {
+		pm.sendErrorResponse(c, http.StatusBadRequest, "model name required")
+		return
+	}
+
+	// Check if it's an OAI model
+	realModelName, found := pm.config.RealModelName(requestedModel)
+	if found {
+		group := pm.findGroupByModelName(realModelName)
+		if group != nil && group.backendType != "ollama" {
+			// Return info about OAI model
+			modelConfig := pm.config.Models[realModelName]
+
+			response := gin.H{
+				"modelfile":  fmt.Sprintf("# OpenAI Compatible Model: %s\n# Proxied through llama-swap", realModelName),
+				"parameters": "temperature 0.7\ntop_p 0.9\ntop_k 40",
+				"template":   "{{ .Prompt }}",
+				"details": gin.H{
+					"format":             "openai",
+					"family":             "openai",
+					"parameter_size":     "unknown",
+					"quantization_level": "none",
+				},
+			}
+
+			if modelConfig.Description != "" {
+				response["description"] = modelConfig.Description
+			}
+
+			c.JSON(http.StatusOK, response)
+			return
+		}
+	}
+
+	// Otherwise, pass through to Ollama
+	pm.handleOllamaPassthroughRequest(c, bodyBytes, requestedModel)
+}
+
+// New method to handle translation from Ollama to OAI
+func (pm *ProxyManager) handleOllamaToOAITranslation(c *gin.Context, bodyBytes []byte, modelName string) {
+	endpoint := c.Request.URL.Path
+
+	// Check for unload request first
+	keepAlive := gjson.GetBytes(bodyBytes, "keep_alive")
+	if keepAlive.Exists() && keepAlive.Int() == 0 {
+		prompt := gjson.GetBytes(bodyBytes, "prompt").String()
+		messages := gjson.GetBytes(bodyBytes, "messages").Array()
+
+		if prompt == "" && len(messages) == 0 {
+			pm.ollamaTranslator.handleUnloadRequest(c, modelName)
+			return
+		}
+	}
+
+	// Translate the request based on endpoint
+	var oaiReqBytes []byte
+	var err error
+	var isChat bool
+
+	switch endpoint {
+	case "/api/generate":
+		oaiReqBytes, err = pm.ollamaTranslator.translateOllamaGenerateToOAI(bodyBytes)
+		isChat = false
+	case "/api/chat":
+		oaiReqBytes, err = pm.ollamaTranslator.translateOllamaChatToOAI(bodyBytes)
+		isChat = true
+	default:
+		pm.sendErrorResponse(c, http.StatusBadRequest, "unsupported Ollama endpoint for OAI model")
+		return
+	}
+
+	if err != nil {
+		if err.Error() == "unload_request" {
+			pm.ollamaTranslator.handleUnloadRequest(c, modelName)
+			return
+		}
+		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("translation error: %s", err.Error()))
+		return
+	}
+
+	// Create a response interceptor
+	interceptor := &OllamaResponseInterceptor{
+		ResponseWriter: c.Writer,
+		translator:     pm.ollamaTranslator,
+		originalModel:  modelName,
+		isStreaming:    gjson.GetBytes(oaiReqBytes, "stream").Bool(),
+		isChat:         isChat, // Set this field
+	}
+
+	// Create new request with translated body
+	newReq, err := http.NewRequestWithContext(
+		c.Request.Context(),
+		"POST",
+		"/v1/chat/completions",
+		bytes.NewReader(oaiReqBytes),
+	)
+	if err != nil {
+		pm.sendErrorResponse(c, http.StatusInternalServerError, "failed to create translated request")
+		return
+	}
+
+	// Copy headers
+	newReq.Header = c.Request.Header.Clone()
+	newReq.Header.Set("Content-Type", "application/json")
+	newReq.Header.Set("Content-Length", strconv.Itoa(len(oaiReqBytes)))
+
+	// Process through OAI handler with intercepted response
+	c.Writer = interceptor
+	c.Request = newReq
+	pm.proxyOAIHandler(c)
+
+	// Finalize the response translation
+	interceptor.finalize()
+}
+
+// Response interceptor to translate OAI responses back to Ollama format
+type OllamaResponseInterceptor struct {
+	gin.ResponseWriter
+	translator    *OllamaToOAITranslator
+	originalModel string
+	isStreaming   bool
+	isChat        bool
+	buffer        []byte
+	statusCode    int
+	headerWritten bool
+}
+
+func (i *OllamaResponseInterceptor) Write(data []byte) (int, error) {
+	// Buffer the response for translation
+	i.buffer = append(i.buffer, data...)
+	return len(data), nil
+}
+
+func (i *OllamaResponseInterceptor) Flush() {
+	// For streaming responses, translate and flush chunks
+	if i.isStreaming && len(i.buffer) > 0 {
+		translated, err := i.translator.translateOAIResponseToOllama(i.buffer, true, i.originalModel, i.isChat)
+		if err == nil {
+			i.ResponseWriter.Write(translated)
+			if flusher, ok := i.ResponseWriter.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		i.buffer = nil
+	}
+}
+
+func (i *OllamaResponseInterceptor) CloseNotify() <-chan bool {
+	if cn, ok := i.ResponseWriter.(http.CloseNotifier); ok {
+		return cn.CloseNotify()
+	}
+	return nil
+}
+
+// Add this to handle the final response
+func (i *OllamaResponseInterceptor) finalize() {
+	if i.statusCode == 0 {
+		i.statusCode = http.StatusOK
+	}
+
+	// Make sure headers are written
+	if !i.headerWritten {
+		i.WriteHeader(i.statusCode)
+	}
+
+	// Handle error responses
+	if i.statusCode != http.StatusOK {
+		i.ResponseWriter.Write(i.buffer)
+		return
+	}
+
+	// Translate the response
+	translated, err := i.translator.translateOAIResponseToOllama(i.buffer, i.isStreaming, i.originalModel, i.isChat)
+	if err != nil {
+		// Fall back to original response
+		i.ResponseWriter.Write(i.buffer)
+		return
+	}
+
+	// Write translated response
+	i.ResponseWriter.Write(translated)
+}
+
+// Existing passthrough logic (refactored from original)
+func (pm *ProxyManager) handleOllamaPassthroughRequest(c *gin.Context, bodyBytes []byte, requestedModel string) {
 	// Find Ollama process group
 	ollamaGroup := pm.findOllamaGroup()
 	if ollamaGroup == nil {
@@ -617,19 +1023,9 @@ func (pm *ProxyManager) proxyOllamaPassthrough(c *gin.Context) {
 		return
 	}
 
-	// If we have a model, do the management logic
+	// If we have a model, update the body with the real name
 	if requestedModel != "" {
-		// Try to map the model name through existing config
-		realModelName, found := pm.config.RealModelName(requestedModel)
-		if found {
-			// Use the real model name
-			bodyBytes, err = sjson.SetBytes(bodyBytes, "model", realModelName)
-			if err != nil {
-				pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error rewriting model name: %s", err.Error()))
-				return
-			}
-			requestedModel = realModelName
-		}
+		bodyBytes, _ = sjson.SetBytes(bodyBytes, "model", requestedModel)
 
 		// Send unload signal to other process groups
 		pm.signalUnloadOtherGroups(ollamaGroup, requestedModel)
@@ -641,22 +1037,12 @@ func (pm *ProxyManager) proxyOllamaPassthrough(c *gin.Context) {
 	c.Request.Header.Set("content-length", strconv.Itoa(len(bodyBytes)))
 	c.Request.ContentLength = int64(len(bodyBytes))
 
-	// Direct HTTP call to Ollama (bypass ProcessGroup.ProxyRequest)
+	// Direct HTTP call to Ollama
 	if err := pm.proxyDirectToOllama(ollamaGroup, c.Writer, c.Request); err != nil {
 		pm.sendErrorResponse(c, http.StatusInternalServerError, fmt.Sprintf("error proxying to Ollama: %s", err.Error()))
 		pm.proxyLogger.Errorf("Error Proxying Ollama Request for model %s: %v", requestedModel, err)
 		return
 	}
-}
-
-func (pm *ProxyManager) findOllamaGroup() *ProcessGroup {
-	// Look for a group configured as Ollama backend
-	for _, group := range pm.processGroups {
-		if group.backendType == "ollama" {
-			return group
-		}
-	}
-	return nil
 }
 
 func (pm *ProxyManager) signalUnloadOtherGroups(activeGroup *ProcessGroup, newModel string) {
